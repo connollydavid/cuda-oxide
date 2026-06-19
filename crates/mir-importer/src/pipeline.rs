@@ -867,6 +867,31 @@ fn contains_tma_multicast(ll_path: &Path) -> bool {
     }
 }
 
+/// Checks for Ampere-only (sm_80+) ops that are NOT lowerable on Turing (sm_75).
+/// (sm75-port) These fall through the five tier detectors above to `Basic`; if
+/// `Basic` maps to sm_75 they would be emitted into `.target sm_75` PTX that ptxas
+/// rejects. So we classify any kernel using one as `Sm80` (floor sm_80) instead.
+///
+/// The detector reads the PRE-llc .ll, so it matches the spelling that survives
+/// there: the basic mbarrier ops appear as `llvm.nvvm.mbarrier.*` intrinsic-name
+/// substrings (`mbarrier.init`, `mbarrier.inval`); the others appear as literal PTX
+/// strings in inline asm. It must NOT match the Turing-safe `cvt.rn.f16x2.f32`, nor
+/// the Hopper+ `mbarrier.arrive.expect_tx` / `mbarrier.try_wait` (the Tma detector's).
+fn contains_sm80_only_features(ll_path: &Path) -> bool {
+    if let Ok(contents) = std::fs::read_to_string(ll_path) {
+        contents.contains("redux.sync")
+            || contents.contains("fma.rn.bf16x2")
+            || contents.contains("cvt.rn.bf16x2.f32")
+            || contents.contains("stmatrix.")
+            || contents.contains("mbarrier.init")
+            || contents.contains("mbarrier.test_wait")
+            || contents.contains("mbarrier.arrive.shared")
+            || contents.contains("mbarrier.inval")
+    } else {
+        false
+    }
+}
+
 /// GPU features detected in LLVM IR that determine target selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetectedFeatures {
@@ -880,7 +905,11 @@ enum DetectedFeatures {
     Tma,
     /// Thread Block Clusters (sm_90+, forward-compatible).
     Cluster,
-    /// No special features (maximum compatibility, sm_80).
+    /// Ampere-only ops not lowerable below sm_80: redux.sync, fma.rn.bf16x2,
+    /// cvt.rn.bf16x2.f32, stmatrix, basic mbarrier (init/test_wait/arrive/inval).
+    /// Floor sm_80. (sm75-port)
+    Sm80,
+    /// No op above sm_75 — Turing-safe, maximum compatibility. Floor sm_75. (sm75-port)
     Basic,
 }
 
@@ -899,7 +928,9 @@ fn select_target(features: DetectedFeatures) -> &'static str {
         // Cluster features require sm_90+ but are forward-compatible.
         // Use sm_90 for Hopper compatibility, works on Blackwell too.
         DetectedFeatures::Cluster => "sm_90",
-        DetectedFeatures::Basic => "sm_80",
+        // sm75-port: Sm80 keeps the Ampere floor; Basic is now Turing-safe (sm_75).
+        DetectedFeatures::Sm80 => "sm_80",
+        DetectedFeatures::Basic => "sm_75",
     }
 }
 
@@ -910,7 +941,8 @@ fn select_target(features: DetectedFeatures) -> &'static str {
 /// datacenter-Blackwell family: consumer Blackwell (sm_120) and Hopper (sm_90)
 /// lack them, so an sm_120 GPU cannot run an sm_100 tcgen05 kernel even though
 /// 120 > 100. WGMMA is Hopper-only. The remaining features are forward
-/// compatible from their floor (TMA / cluster need sm_90+, basic needs sm_80+).
+/// compatible from their floor (TMA / cluster need sm_90+; sm75-port: Sm80 needs
+/// sm_80+, basic needs sm_70+ — Turing/Volta).
 ///
 /// Used to decide whether the GPU in this machine (the `CUDA_OXIDE_DEVICE_ARCH`
 /// hint) can actually run the kernel, or whether we must build for the arch the
@@ -923,7 +955,9 @@ fn arch_satisfies(arch: &str, features: DetectedFeatures) -> bool {
         DetectedFeatures::Blackwell | DetectedFeatures::TmaMulticast => major == 10,
         DetectedFeatures::Wgmma => major == 9,
         DetectedFeatures::Tma | DetectedFeatures::Cluster => major >= 9,
-        DetectedFeatures::Basic => major >= 8,
+        // sm75-port: Sm80 needs Ampere+; Basic now lowers on Turing (sm_75) too.
+        DetectedFeatures::Sm80 => major >= 8,
+        DetectedFeatures::Basic => major >= 7,
     }
 }
 
@@ -1033,12 +1067,15 @@ fn generate_ptx(
         contains_wgmma_features(ll_path),
         contains_tma_features(ll_path),
         contains_cluster_features(ll_path),
+        // sm75-port: Ampere-only ops gate to Sm80 before the Turing fall-through.
+        contains_sm80_only_features(ll_path),
     ) {
-        (true, _, _, _, _) => DetectedFeatures::Blackwell,
-        (_, true, _, _, _) => DetectedFeatures::TmaMulticast,
-        (_, _, true, _, _) => DetectedFeatures::Wgmma,
-        (_, _, _, true, _) => DetectedFeatures::Tma,
-        (_, _, _, _, true) => DetectedFeatures::Cluster,
+        (true, _, _, _, _, _) => DetectedFeatures::Blackwell,
+        (_, true, _, _, _, _) => DetectedFeatures::TmaMulticast,
+        (_, _, true, _, _, _) => DetectedFeatures::Wgmma,
+        (_, _, _, true, _, _) => DetectedFeatures::Tma,
+        (_, _, _, _, true, _) => DetectedFeatures::Cluster,
+        (_, _, _, _, _, true) => DetectedFeatures::Sm80,
         _ => DetectedFeatures::Basic,
     };
 
@@ -1053,17 +1090,29 @@ fn generate_ptx(
     //      load on this GPU, but feature-gated examples handle that at load time
     //      (cuModuleLoad reports INVALID_PTX and they skip execution).
     //   3. neither set -- the feature floor.
+    // sm75-port: fail closed. An explicit override OR a detected GPU that cannot
+    // run the kernel's features is REJECTED, never silently downgraded to the floor
+    // (the old device-hint path emitted floor PTX that would not load on the present
+    // GPU). The floor is used only for a true headless cross-compile — neither the
+    // override nor the device arch is set. For deliberate cross-compilation, set
+    // CUDA_OXIDE_TARGET to a satisfying arch.
     let (target, target_source): (String, &str) = if let Some(t) = explicit_override {
         if !arch_satisfies(&t, detected) {
-            eprintln!(
-                "warning: CUDA_OXIDE_TARGET={t} cannot lower the detected feature \
-                 {detected:?} (needs {feature_arch}); PTX generation will likely \
-                 fail. Unset CUDA_OXIDE_TARGET to let cuda-oxide select \
-                 {feature_arch} automatically."
-            );
+            return Err(PipelineError::PtxGeneration(format!(
+                "CUDA_OXIDE_TARGET={t} cannot lower the detected feature {detected:?} \
+                 (needs {feature_arch}). Refusing to emit PTX the target cannot run. \
+                 Set CUDA_OXIDE_TARGET to {feature_arch} or newer, or unset it."
+            )));
         }
         (t, "CUDA_OXIDE_TARGET")
-    } else if let Some(dev) = device_hint.filter(|d| arch_satisfies(d, detected)) {
+    } else if let Some(dev) = device_hint {
+        if !arch_satisfies(&dev, detected) {
+            return Err(PipelineError::PtxGeneration(format!(
+                "the detected GPU {dev} cannot run this kernel's features {detected:?} \
+                 (needs {feature_arch}). Refusing to emit unrunnable PTX. Build on a \
+                 {feature_arch}+ device, or set CUDA_OXIDE_TARGET={feature_arch} to cross-compile."
+            )));
+        }
         (dev, "detected GPU")
     } else {
         (feature_arch.to_string(), "feature requirement")
@@ -1482,7 +1531,9 @@ mod tests {
         assert_eq!(select_target(DetectedFeatures::Wgmma), "sm_90a");
         assert_eq!(select_target(DetectedFeatures::Tma), "sm_100");
         assert_eq!(select_target(DetectedFeatures::Cluster), "sm_90");
-        assert_eq!(select_target(DetectedFeatures::Basic), "sm_80");
+        // sm75-port
+        assert_eq!(select_target(DetectedFeatures::Sm80), "sm_80");
+        assert_eq!(select_target(DetectedFeatures::Basic), "sm_75");
     }
 
     #[test]
@@ -1534,6 +1585,56 @@ mod tests {
         }
         assert!(arch_satisfies("sm_80", DetectedFeatures::Basic));
         assert!(!arch_satisfies("sm_80", DetectedFeatures::Tma));
+        // sm75-port: Basic lowers on Turing; Sm80 is gated off sm_75.
+        assert!(arch_satisfies("sm_75", DetectedFeatures::Basic));
+        assert!(!arch_satisfies("sm_75", DetectedFeatures::Sm80));
+        assert!(arch_satisfies("sm_80", DetectedFeatures::Sm80));
+        assert!(arch_satisfies("sm_90a", DetectedFeatures::Sm80));
+    }
+
+    /// sm75-port: the Sm80 detector classifies Ampere-only ops (the refuted-crux
+    /// counterexamples) as Sm80, and leaves Turing-safe lookalikes as Basic.
+    #[test]
+    fn test_contains_sm80_only_features_classifies_ampere_ops() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let ampere_ops = [
+            "redux.sync.add.s32 %r1, %r2, 0xffffffff;",
+            "fma.rn.bf16x2 %r1, %r2, %r3, %r4;",
+            "cvt.rn.bf16x2.f32 %r1, %f1, %f2;",
+            "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%r1], {%r2,%r3,%r4,%r5};",
+            "  call void @llvm.nvvm.mbarrier.init(ptr %bar, i32 1)",
+            "mbarrier.test_wait.shared.b64 %p, [%r1], %r2;",
+            "mbarrier.arrive.shared.b64 %r1, [%r2];",
+            "  call void @llvm.nvvm.mbarrier.inval(ptr %bar)",
+        ];
+        for (i, op) in ampere_ops.iter().enumerate() {
+            let p = dir.join(format!("sm75port_pos_{i}.ll"));
+            let mut f = std::fs::File::create(&p).unwrap();
+            writeln!(f, "; positive sample\n{op}").unwrap();
+            assert!(
+                contains_sm80_only_features(&p),
+                "Ampere-only op must classify Sm80: {op}"
+            );
+            let _ = std::fs::remove_file(&p);
+        }
+
+        // Turing-safe lookalikes must NOT classify Sm80.
+        let p = dir.join("sm75port_neg.ll");
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(
+            f,
+            "  cvt.rn.f16x2.f32 %r1, %f1, %f2;\n  \
+             mbarrier.arrive.expect_tx.shared.b64 %r1, [%r2], 64;\n  \
+             mbarrier.try_wait.shared.b64 %p, [%r1], %r2;\n  \
+             bar.sync 0;\n  shfl.sync.down.b32 %r1, %r2, 1, 31, 0xffffffff;\n  redux %r1;"
+        )
+        .unwrap();
+        assert!(
+            !contains_sm80_only_features(&p),
+            "Turing-safe ops must NOT classify Sm80"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     /// Build a minimal LLVM dialect module containing a single function

@@ -1,0 +1,19 @@
+[package]
+name = "sm75_coop_smoke"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Standalone crate (not part of the parent workspace).
+[workspace]
+
+# Milestone-0001 (agentic-yarn-vllm) acceptance test for the sm_75 codegen port.
+# A Turing-safe cooperative kernel: classifies DetectedFeatures::Basic, must emit
+# `.target sm_75`, pass ptxas -arch=sm_75, JIT-load, and run on the Quadro RTX 6000.
+#   Build (PTX only): cargo oxide build sm75_coop_smoke
+#   Run  (real GPU):  cargo oxide run   sm75_coop_smoke
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }
